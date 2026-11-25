@@ -1,0 +1,126 @@
+name: build
+
+# Branch layout:
+#   master   mirrors upstream (chuckcharlie/cups-avahi-airprint) and is never
+#            committed to directly, so it never triggers a build.
+#   release  this fork's changes on top of master. Every push to it publishes.
+#
+# Publishes on: push to release, a v* tag, or a manual run.
+# Builds only (no publish) on: pull requests into release.
+# Documentation-only pushes are skipped.
+on:
+  push:
+    branches: [release]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore']
+  pull_request:
+    branches: [release]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Target platforms (arm64 builds under QEMU and is slow)'
+        default: 'linux/amd64'
+        type: choice
+        options:
+          - linux/amd64
+          - linux/amd64,linux/arm64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/cups-avahi-airprint
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      # Actions are pinned by commit SHA; the comment is the release it came from.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Work out tags
+        id: meta
+        run: |
+          version="$(tr -d '[:space:]' < version.txt)"
+          short="${GITHUB_SHA::7}"
+          publish=true
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            publish=false
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] && [ "${GITHUB_REF#refs/tags/v}" != "$version" ]; then
+            echo "::error::Tag ${GITHUB_REF#refs/tags/} does not match version.txt ($version)"
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "platforms=${{ inputs.platforms || 'linux/amd64' }}"
+            # No moving "latest" tag: deploy by version or digest only.
+            echo "tags=${IMAGE}:${version},${IMAGE}:${version}-${short}"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: contains(steps.meta.outputs.platforms, 'arm64')
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: steps.meta.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build${{ steps.meta.outputs.publish == 'true' && ' and push' || '' }}
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ steps.meta.outputs.platforms }}
+          push: ${{ steps.meta.outputs.publish == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          # Lets an image found on a host be traced back to the exact commit.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+          provenance: mode=max
+          sbom: true
+          no-cache: ${{ steps.meta.outputs.publish == 'true' }}
+
+      - name: Attest build provenance
+        if: steps.meta.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        if: steps.meta.outputs.publish == 'true'
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${IMAGE}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Tags: ${{ steps.meta.outputs.tags }}"
+            echo
+            echo "Commit: ${GITHUB_SHA}"
+          } >> "$GITHUB_STEP_SUMMARY"
